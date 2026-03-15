@@ -9,6 +9,8 @@ services:
     startCommand: |
       cd backend && gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 300 --preload wsgi:app
     envVars:
+      - key: XDG_CACHE_HOME
+        value: "/opt/render/project/.render/cache"
       - key: PYTHON_VERSION
         value: "3.11.11"
       - key: FLASK_DEBUG
