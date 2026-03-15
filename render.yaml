@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: mirofish-backend
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: |
+      cd backend && pip install -r requirements.txt
+    startCommand: |
+      cd backend && gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 300 "app:create_app()"
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.11"
+      - key: FLASK_DEBUG
+        value: "False"
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        sync: false
+      - key: LLM_MODEL_NAME
+        sync: false
+      - key: ZEP_API_KEY
+        sync: false
+      - key: LLM_BOOST_API_KEY
+        sync: false
+      - key: LLM_BOOST_BASE_URL
+        sync: false
+      - key: LLM_BOOST_MODEL_NAME
+        sync: false
+    healthCheckPath: /health
