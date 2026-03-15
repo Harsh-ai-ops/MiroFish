@@ -413,18 +413,22 @@ class SimulationRunner:
             def _run_simulation_thread():
                 """Run the simulation in a background thread with its own event loop."""
                 try:
-                    # Add scripts dir to path so imports work
-                    scripts_dir = os.path.join(
+                    # Add both scripts dir and backend dir to path
+                    # so the script's own imports (action_logger, etc.) work
+                    backend_dir = os.path.join(
                         os.path.dirname(__file__),
-                        '../../scripts'
+                        '../..'
                     )
-                    scripts_dir = os.path.abspath(scripts_dir)
-                    if scripts_dir not in sys.path:
-                        sys.path.insert(0, scripts_dir)
+                    backend_dir = os.path.abspath(backend_dir)
+                    scripts_dir = os.path.join(backend_dir, 'scripts')
+                    
+                    for d in [scripts_dir, backend_dir]:
+                        if d not in sys.path:
+                            sys.path.insert(0, d)
                     
                     # Import the simulation script's inline runner
-                    # We do this inside the thread to avoid import side effects at module load
-                    from scripts.run_parallel_simulation import run_inline
+                    # The scripts dir is on sys.path, so import directly
+                    from run_parallel_simulation import run_inline
                     
                     # Create a new event loop for this thread
                     loop = _asyncio.new_event_loop()
@@ -435,13 +439,8 @@ class SimulationRunner:
                     shutdown_event_holder[0] = shutdown_event
                     cls._shutdown_events[simulation_id] = shutdown_event
                     
-                    # Redirect stdout/stderr to simulation.log
+                    # Write simulation output to log file
                     main_log_path = os.path.join(sim_dir, "simulation.log")
-                    log_file = open(main_log_path, 'w', encoding='utf-8')
-                    old_stdout = sys.stdout
-                    old_stderr = sys.stderr
-                    sys.stdout = log_file
-                    sys.stderr = log_file
                     
                     try:
                         loop.run_until_complete(run_inline(
@@ -455,12 +454,14 @@ class SimulationRunner:
                     except Exception as e:
                         logger.error(f"Simulation thread error: {simulation_id}, error={e}")
                         cls._sim_exit_codes[simulation_id] = 1
-                        import traceback
-                        traceback.print_exc(file=log_file)
+                        # Write error to log file
+                        try:
+                            import traceback
+                            with open(main_log_path, 'a', encoding='utf-8') as lf:
+                                traceback.print_exc(file=lf)
+                        except Exception:
+                            pass
                     finally:
-                        sys.stdout = old_stdout
-                        sys.stderr = old_stderr
-                        log_file.close()
                         loop.close()
                         
                 except Exception as e:

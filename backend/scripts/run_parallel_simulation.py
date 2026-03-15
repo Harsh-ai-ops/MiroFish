@@ -171,7 +171,9 @@ try:
 except ImportError as e:
     print(f"错误: 缺少依赖 {e}")
     print("请先安装: pip install oasis-ai camel-ai")
-    sys.exit(1)
+    # Don't sys.exit() here - when imported in-process by simulation_runner,
+    # sys.exit would kill the entire Gunicorn worker. Raise instead.
+    raise ImportError(f"Missing OASIS/Camel dependencies: {e}") from e
 
 
 # Twitter可用动作（不包含INTERVIEW，INTERVIEW只能通过ManualAction手动触发）
