@@ -1489,6 +1489,146 @@ async def run_reddit_simulation(
     return result
 
 
+async def run_inline(
+    config_path: str,
+    platform: str = "parallel",
+    max_rounds: int = None,
+    shutdown_event_external=None,
+    no_wait: bool = True
+):
+    """
+    In-process entry point for running the simulation.
+    
+    Called by SimulationRunner in a background thread to avoid spawning
+    a separate Python process (which would double memory usage and cause
+    OOM kills on Render's 512MB free tier).
+    
+    Args:
+        config_path: Path to simulation_config.json
+        platform: "twitter", "reddit", or "parallel"
+        max_rounds: Optional max rounds to run
+        shutdown_event_external: An asyncio.Event from the caller to signal shutdown
+        no_wait: If True, don't enter command-waiting mode after simulation
+    """
+    global _shutdown_event
+    
+    if shutdown_event_external:
+        _shutdown_event = shutdown_event_external
+    else:
+        _shutdown_event = asyncio.Event()
+    
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    config = load_config(config_path)
+    simulation_dir = os.path.dirname(config_path) or "."
+    wait_for_commands = not no_wait
+    
+    # Save and change working directory
+    original_cwd = os.getcwd()
+    try:
+        os.chdir(simulation_dir)
+        
+        # Initialize logging (disable OASIS logs, clean old files)
+        init_logging_for_simulation(simulation_dir)
+        
+        # Create log manager
+        log_manager = SimulationLogManager(simulation_dir)
+        twitter_logger = log_manager.get_twitter_logger()
+        reddit_logger = log_manager.get_reddit_logger()
+        
+        log_manager.info("=" * 60)
+        log_manager.info("OASIS Parallel Simulation (in-process)")
+        log_manager.info(f"Config: {config_path}")
+        log_manager.info(f"Simulation ID: {config.get('simulation_id', 'unknown')}")
+        log_manager.info(f"Wait for commands: {'enabled' if wait_for_commands else 'disabled'}")
+        log_manager.info("=" * 60)
+        
+        time_config = config.get("time_config", {})
+        total_hours = time_config.get('total_simulation_hours', 72)
+        minutes_per_round = time_config.get('minutes_per_round', 30)
+        config_total_rounds = (total_hours * 60) // minutes_per_round
+        
+        log_manager.info(f"Simulation params:")
+        log_manager.info(f"  - Total hours: {total_hours}")
+        log_manager.info(f"  - Minutes per round: {minutes_per_round}")
+        log_manager.info(f"  - Config total rounds: {config_total_rounds}")
+        if max_rounds:
+            log_manager.info(f"  - Max rounds limit: {max_rounds}")
+            if max_rounds < config_total_rounds:
+                log_manager.info(f"  - Actual rounds: {max_rounds} (truncated)")
+        log_manager.info(f"  - Agent count: {len(config.get('agent_configs', []))}")
+        log_manager.info("=" * 60)
+        
+        start_time = datetime.now()
+        
+        twitter_result = None
+        reddit_result = None
+        
+        twitter_only = (platform == "twitter")
+        reddit_only = (platform == "reddit")
+        
+        if twitter_only:
+            twitter_result = await run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, max_rounds)
+        elif reddit_only:
+            reddit_result = await run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, max_rounds)
+        else:
+            results = await asyncio.gather(
+                run_twitter_simulation(config, simulation_dir, twitter_logger, log_manager, max_rounds),
+                run_reddit_simulation(config, simulation_dir, reddit_logger, log_manager, max_rounds),
+            )
+            twitter_result, reddit_result = results
+        
+        total_elapsed = (datetime.now() - start_time).total_seconds()
+        log_manager.info("=" * 60)
+        log_manager.info(f"Simulation loop complete! Total time: {total_elapsed:.1f}s")
+        
+        # Wait for commands mode (if enabled)
+        if wait_for_commands:
+            log_manager.info("Entering command-waiting mode...")
+            ipc_handler = ParallelIPCHandler(
+                simulation_dir=simulation_dir,
+                twitter_env=twitter_result.env if twitter_result else None,
+                twitter_agent_graph=twitter_result.agent_graph if twitter_result else None,
+                reddit_env=reddit_result.env if reddit_result else None,
+                reddit_agent_graph=reddit_result.agent_graph if reddit_result else None
+            )
+            ipc_handler.update_status("alive")
+            
+            try:
+                while not _shutdown_event.is_set():
+                    should_continue = await ipc_handler.process_commands()
+                    if not should_continue:
+                        break
+                    try:
+                        await asyncio.wait_for(_shutdown_event.wait(), timeout=0.5)
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                pass
+            except Exception as e:
+                log_manager.info(f"Command processing error: {e}")
+            
+            ipc_handler.update_status("stopped")
+        
+        # Close environments
+        if twitter_result and twitter_result.env:
+            await twitter_result.env.close()
+            log_manager.info("[Twitter] Environment closed")
+        
+        if reddit_result and reddit_result.env:
+            await reddit_result.env.close()
+            log_manager.info("[Reddit] Environment closed")
+        
+        log_manager.info("=" * 60)
+        log_manager.info("All done!")
+        log_manager.info("=" * 60)
+    
+    finally:
+        os.chdir(original_cwd)
+
+
 async def main():
     parser = argparse.ArgumentParser(description='OASIS双平台并行模拟')
     parser.add_argument(

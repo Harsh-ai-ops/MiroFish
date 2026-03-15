@@ -217,11 +217,16 @@ class SimulationRunner:
     
     # 内存中的运行状态
     _run_states: Dict[str, SimulationRunState] = {}
-    _processes: Dict[str, subprocess.Popen] = {}
+    _processes: Dict[str, subprocess.Popen] = {}  # Legacy, kept for compatibility
     _action_queues: Dict[str, Queue] = {}
     _monitor_threads: Dict[str, threading.Thread] = {}
     _stdout_files: Dict[str, Any] = {}  # 存储 stdout 文件句柄
     _stderr_files: Dict[str, Any] = {}  # 存储 stderr 文件句柄
+    
+    # In-process thread-based simulation (avoids OOM from subprocess)
+    _sim_threads: Dict[str, threading.Thread] = {}
+    _shutdown_events: Dict[str, Any] = {}  # asyncio.Event per simulation
+    _sim_exit_codes: Dict[str, Optional[int]] = {}  # 0=success, 1=error
     
     # 图谱记忆更新配置
     _graph_memory_enabled: Dict[str, bool] = {}  # simulation_id -> enabled
@@ -383,76 +388,96 @@ class SimulationRunner:
         else:
             cls._graph_memory_enabled[simulation_id] = False
         
-        # 确定运行哪个脚本（脚本位于 backend/scripts/ 目录）
+        # 确定平台
         if platform == "twitter":
-            script_name = "run_twitter_simulation.py"
             state.twitter_running = True
         elif platform == "reddit":
-            script_name = "run_reddit_simulation.py"
             state.reddit_running = True
         else:
-            script_name = "run_parallel_simulation.py"
             state.twitter_running = True
             state.reddit_running = True
-        
-        script_path = os.path.join(cls.SCRIPTS_DIR, script_name)
-        
-        if not os.path.exists(script_path):
-            raise ValueError(f"脚本不存在: {script_path}")
         
         # 创建动作队列
         action_queue = Queue()
         cls._action_queues[simulation_id] = action_queue
         
-        # 启动模拟进程
+        # 启动模拟 - 使用 in-process 线程代替 subprocess
+        # 这样可以共享已加载的 Python 解释器和库，避免在 Render 512MB 限制下 OOM
         try:
-            # 构建运行命令，使用完整路径
-            # 新的日志结构：
-            #   twitter/actions.jsonl - Twitter 动作日志
-            #   reddit/actions.jsonl  - Reddit 动作日志
-            #   simulation.log        - 主进程日志
+            import asyncio as _asyncio
             
-            cmd = [
-                sys.executable,  # Python解释器
-                script_path,
-                "--config", config_path,  # 使用完整配置文件路径
-            ]
+            # Create a shutdown event for this simulation
+            # We create it in the thread since it needs a running event loop
+            shutdown_event_holder = [None]
             
-            # 如果指定了最大轮数，添加到命令行参数
-            if max_rounds is not None and max_rounds > 0:
-                cmd.extend(["--max-rounds", str(max_rounds)])
+            def _run_simulation_thread():
+                """Run the simulation in a background thread with its own event loop."""
+                try:
+                    # Add scripts dir to path so imports work
+                    scripts_dir = os.path.join(
+                        os.path.dirname(__file__),
+                        '../../scripts'
+                    )
+                    scripts_dir = os.path.abspath(scripts_dir)
+                    if scripts_dir not in sys.path:
+                        sys.path.insert(0, scripts_dir)
+                    
+                    # Import the simulation script's inline runner
+                    # We do this inside the thread to avoid import side effects at module load
+                    from scripts.run_parallel_simulation import run_inline
+                    
+                    # Create a new event loop for this thread
+                    loop = _asyncio.new_event_loop()
+                    _asyncio.set_event_loop(loop)
+                    
+                    # Create the shutdown event in this loop's context
+                    shutdown_event = _asyncio.Event()
+                    shutdown_event_holder[0] = shutdown_event
+                    cls._shutdown_events[simulation_id] = shutdown_event
+                    
+                    # Redirect stdout/stderr to simulation.log
+                    main_log_path = os.path.join(sim_dir, "simulation.log")
+                    log_file = open(main_log_path, 'w', encoding='utf-8')
+                    old_stdout = sys.stdout
+                    old_stderr = sys.stderr
+                    sys.stdout = log_file
+                    sys.stderr = log_file
+                    
+                    try:
+                        loop.run_until_complete(run_inline(
+                            config_path=config_path,
+                            platform=platform,
+                            max_rounds=max_rounds,
+                            shutdown_event_external=shutdown_event,
+                            no_wait=True,
+                        ))
+                        cls._sim_exit_codes[simulation_id] = 0
+                    except Exception as e:
+                        logger.error(f"Simulation thread error: {simulation_id}, error={e}")
+                        cls._sim_exit_codes[simulation_id] = 1
+                        import traceback
+                        traceback.print_exc(file=log_file)
+                    finally:
+                        sys.stdout = old_stdout
+                        sys.stderr = old_stderr
+                        log_file.close()
+                        loop.close()
+                        
+                except Exception as e:
+                    logger.error(f"Simulation thread fatal error: {simulation_id}, error={e}")
+                    cls._sim_exit_codes[simulation_id] = 1
             
-            # 创建主日志文件，避免 stdout/stderr 管道缓冲区满导致进程阻塞
-            main_log_path = os.path.join(sim_dir, "simulation.log")
-            main_log_file = open(main_log_path, 'w', encoding='utf-8')
-            
-            # 设置子进程环境变量，确保 Windows 上使用 UTF-8 编码
-            # 这可以修复第三方库（如 OASIS）读取文件时未指定编码的问题
-            env = os.environ.copy()
-            env['PYTHONUTF8'] = '1'  # Python 3.7+ 支持，让所有 open() 默认使用 UTF-8
-            env['PYTHONIOENCODING'] = 'utf-8'  # 确保 stdout/stderr 使用 UTF-8
-            
-            # 设置工作目录为模拟目录（数据库等文件会生成在此）
-            # 使用 start_new_session=True 创建新的进程组，确保可以通过 os.killpg 终止所有子进程
-            process = subprocess.Popen(
-                cmd,
-                cwd=sim_dir,
-                stdout=main_log_file,
-                stderr=subprocess.STDOUT,  # stderr 也写入同一个文件
-                text=True,
-                encoding='utf-8',  # 显式指定编码
-                bufsize=1,
-                env=env,  # 传递带有 UTF-8 设置的环境变量
-                start_new_session=True,  # 创建新进程组，确保服务器关闭时能终止所有相关进程
+            # Launch the simulation thread
+            sim_thread = threading.Thread(
+                target=_run_simulation_thread,
+                name=f"sim-{simulation_id}",
+                daemon=True
             )
+            sim_thread.start()
+            cls._sim_threads[simulation_id] = sim_thread
             
-            # 保存文件句柄以便后续关闭
-            cls._stdout_files[simulation_id] = main_log_file
-            cls._stderr_files[simulation_id] = None  # 不再需要单独的 stderr
-            
-            state.process_pid = process.pid
+            state.process_pid = os.getpid()  # Same process
             state.runner_status = RunnerStatus.RUNNING
-            cls._processes[simulation_id] = process
             cls._save_run_state(state)
             
             # 启动监控线程
@@ -464,7 +489,7 @@ class SimulationRunner:
             monitor_thread.start()
             cls._monitor_threads[simulation_id] = monitor_thread
             
-            logger.info(f"模拟启动成功: {simulation_id}, pid={process.pid}, platform={platform}")
+            logger.info(f"模拟启动成功 (in-process): {simulation_id}, platform={platform}")
             
         except Exception as e:
             state.runner_status = RunnerStatus.FAILED
@@ -476,24 +501,34 @@ class SimulationRunner:
     
     @classmethod
     def _monitor_simulation(cls, simulation_id: str):
-        """监控模拟进程，解析动作日志"""
+        """监控模拟线程，解析动作日志"""
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         
         # 新的日志结构：分平台的动作日志
         twitter_actions_log = os.path.join(sim_dir, "twitter", "actions.jsonl")
         reddit_actions_log = os.path.join(sim_dir, "reddit", "actions.jsonl")
         
+        # Check for in-process thread first, fall back to subprocess
+        sim_thread = cls._sim_threads.get(simulation_id)
         process = cls._processes.get(simulation_id)
         state = cls.get_run_state(simulation_id)
         
-        if not process or not state:
+        if (not sim_thread and not process) or not state:
             return
         
         twitter_position = 0
         reddit_position = 0
         
+        def _is_running():
+            """Check if simulation is still running (thread or process)."""
+            if sim_thread:
+                return sim_thread.is_alive()
+            elif process:
+                return process.poll() is None
+            return False
+        
         try:
-            while process.poll() is None:  # 进程仍在运行
+            while _is_running():
                 # 读取 Twitter 动作日志
                 if os.path.exists(twitter_actions_log):
                     twitter_position = cls._read_action_log(
@@ -510,14 +545,19 @@ class SimulationRunner:
                 cls._save_run_state(state)
                 time.sleep(2)
             
-            # 进程结束后，最后读取一次日志
+            # 线程/进程结束后，最后读取一次日志
             if os.path.exists(twitter_actions_log):
                 cls._read_action_log(twitter_actions_log, twitter_position, state, "twitter")
             if os.path.exists(reddit_actions_log):
                 cls._read_action_log(reddit_actions_log, reddit_position, state, "reddit")
             
-            # 进程结束
-            exit_code = process.returncode
+            # 获取退出码
+            if sim_thread:
+                exit_code = cls._sim_exit_codes.get(simulation_id, 0)
+            elif process:
+                exit_code = process.returncode
+            else:
+                exit_code = 1
             
             if exit_code == 0:
                 state.runner_status = RunnerStatus.COMPLETED
@@ -534,7 +574,7 @@ class SimulationRunner:
                             error_info = f.read()[-2000:]  # 取最后2000字符
                 except Exception:
                     pass
-                state.error = f"进程退出码: {exit_code}, 错误: {error_info}"
+                state.error = f"退出码: {exit_code}, 错误: {error_info}"
                 logger.error(f"模拟失败: {simulation_id}, error={state.error}")
             
             state.twitter_running = False
@@ -557,7 +597,10 @@ class SimulationRunner:
                     logger.error(f"停止图谱记忆更新器失败: {e}")
                 cls._graph_memory_enabled.pop(simulation_id, None)
             
-            # 清理进程资源
+            # 清理资源
+            cls._sim_threads.pop(simulation_id, None)
+            cls._shutdown_events.pop(simulation_id, None)
+            cls._sim_exit_codes.pop(simulation_id, None)
             cls._processes.pop(simulation_id, None)
             cls._action_queues.pop(simulation_id, None)
             
@@ -781,22 +824,32 @@ class SimulationRunner:
         state.runner_status = RunnerStatus.STOPPING
         cls._save_run_state(state)
         
-        # 终止进程
-        process = cls._processes.get(simulation_id)
-        if process and process.poll() is None:
-            try:
-                cls._terminate_process(process, simulation_id)
-            except ProcessLookupError:
-                # 进程已经不存在
-                pass
-            except Exception as e:
-                logger.error(f"终止进程组失败: {simulation_id}, error={e}")
-                # 回退到直接终止进程
+        # Try in-process shutdown event first (new thread-based approach)
+        shutdown_event = cls._shutdown_events.get(simulation_id)
+        if shutdown_event:
+            logger.info(f"Setting shutdown event for in-process simulation: {simulation_id}")
+            shutdown_event.set()
+            # Wait for the thread to finish
+            sim_thread = cls._sim_threads.get(simulation_id)
+            if sim_thread:
+                sim_thread.join(timeout=15)
+                if sim_thread.is_alive():
+                    logger.warning(f"Simulation thread did not stop in time: {simulation_id}")
+        else:
+            # Fall back to subprocess termination (legacy)
+            process = cls._processes.get(simulation_id)
+            if process and process.poll() is None:
                 try:
-                    process.terminate()
-                    process.wait(timeout=5)
-                except Exception:
-                    process.kill()
+                    cls._terminate_process(process, simulation_id)
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    logger.error(f"终止进程组失败: {simulation_id}, error={e}")
+                    try:
+                        process.terminate()
+                        process.wait(timeout=5)
+                    except Exception:
+                        process.kill()
         
         state.runner_status = RunnerStatus.STOPPED
         state.twitter_running = False
