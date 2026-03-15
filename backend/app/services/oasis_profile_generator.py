@@ -929,6 +929,11 @@ class OasisProfileGenerator:
                 # 实时输出生成的人设到控制台和日志
                 self._print_generated_profile(entity.name, entity_type, profile)
                 
+                # 为免费API添加强制延迟，避免触发速率限制
+                import time
+                if use_llm:
+                    time.sleep(2.5)
+                
                 return idx, profile, None
                 
             except Exception as e:
